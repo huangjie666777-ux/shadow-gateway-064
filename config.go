@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +24,19 @@ type ConfigSnapshot struct {
 	Upstreams []UpstreamConfig `json:"upstreams"`
 }
 
+type ShadowPolicy struct {
+	Enabled          bool   `json:"enabled"`
+	CandidateAddress string `json:"candidate_address"`
+	PathPrefix       string `json:"path_prefix"`
+	MaxConcurrency   int    `json:"max_concurrency"`
+	TimeoutMillis    int    `json:"timeout_ms"`
+}
+
+type ShadowPolicySnapshot struct {
+	ShadowPolicy
+	Version int `json:"version"`
+}
+
 func validateUpstreams(input []UpstreamConfig) error {
 	seen := make(map[string]struct{}, len(input))
 	for i, upstream := range input {
@@ -38,33 +52,50 @@ func validateUpstreams(input []UpstreamConfig) error {
 			return fmt.Errorf("upstream %q limit must be a positive integer", upstream.ID)
 		}
 
-		parsed, err := url.Parse(upstream.Address)
-		if err != nil {
-			return fmt.Errorf("upstream %q address is invalid: %w", upstream.ID, err)
+		if err := validateHTTPAddress(upstream.Address, "upstream "+upstream.ID+" address"); err != nil {
+			return err
 		}
-		if parsed.Scheme != "http" {
-			return fmt.Errorf("upstream %q address must use http", upstream.ID)
-		}
-		if parsed.User != nil {
-			return fmt.Errorf("upstream %q address must only contain host and port", upstream.ID)
-		}
-		if parsed.Path != "" {
-			return fmt.Errorf("upstream %q address must not contain a path", upstream.ID)
-		}
-		if parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
-			return fmt.Errorf("upstream %q address must only contain host and port", upstream.ID)
-		}
-		host, port, err := net.SplitHostPort(parsed.Host)
-		if err != nil || host == "" || port == "" {
-			return fmt.Errorf("upstream %q address must contain a host and port", upstream.ID)
-		}
-		portNumber, err := strconv.Atoi(port)
-		if err != nil || portNumber < 1 || portNumber > 65535 {
-			return fmt.Errorf("upstream %q port must be between 1 and 65535", upstream.ID)
-		}
-		if parsed.Host != net.JoinHostPort(host, port) {
-			return fmt.Errorf("upstream %q address must contain a host and port", upstream.ID)
-		}
+	}
+	return nil
+}
+
+func validateHTTPAddress(address, field string) error {
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return fmt.Errorf("%s is invalid: %w", field, err)
+	}
+	if parsed.Scheme != "http" {
+		return fmt.Errorf("%s must use http", field)
+	}
+	if parsed.User != nil || parsed.Path != "" || parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return fmt.Errorf("%s must only contain host and port", field)
+	}
+	host, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil || host == "" || port == "" {
+		return fmt.Errorf("%s must contain a host and port", field)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("%s port must be between 1 and 65535", field)
+	}
+	if parsed.Host != net.JoinHostPort(host, port) {
+		return fmt.Errorf("%s must contain a host and port", field)
+	}
+	return nil
+}
+
+func validateShadowPolicy(input ShadowPolicy) error {
+	if err := validateHTTPAddress(input.CandidateAddress, "candidate_address"); err != nil {
+		return err
+	}
+	if !strings.HasPrefix(input.PathPrefix, "/") {
+		return errors.New("path_prefix must start with a slash")
+	}
+	if input.MaxConcurrency <= 0 {
+		return errors.New("max_concurrency must be a positive integer")
+	}
+	if input.TimeoutMillis <= 0 {
+		return errors.New("timeout_ms must be a positive integer")
 	}
 	return nil
 }
@@ -88,13 +119,21 @@ func decodeUpstreams(r *http.Request) ([]UpstreamConfig, error) {
 	}
 	upstreams = make([]UpstreamConfig, 0, len(rawItems))
 	for _, raw := range rawItems {
-		decoder := json.NewDecoder(bytes.NewReader(raw))
-		decoder.DisallowUnknownFields()
+		itemDecoder := json.NewDecoder(bytes.NewReader(raw))
+		itemDecoder.DisallowUnknownFields()
 		var upstream UpstreamConfig
-		if err := decoder.Decode(&upstream); err != nil {
+		if err := itemDecoder.Decode(&upstream); err != nil {
 			return nil, err
 		}
 		upstreams = append(upstreams, upstream)
+	}
+	arrayDecoder := json.NewDecoder(bytes.NewReader(trimmed))
+	var array any
+	if err := arrayDecoder.Decode(&array); err != nil {
+		return nil, err
+	}
+	if err := arrayDecoder.Decode(&array); err != io.EOF {
+		return nil, fmt.Errorf("request body must be a single JSON array")
 	}
 	return upstreams, nil
 }

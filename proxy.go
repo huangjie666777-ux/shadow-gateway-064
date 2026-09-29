@@ -8,14 +8,16 @@ import (
 )
 
 type GatewayHandler struct {
-	pool *Pool
+	pool    *Pool
+	shadows *ShadowManager
 }
 
-func NewGatewayHandler(pool *Pool) http.Handler {
-	return &GatewayHandler{pool: pool}
+func NewGatewayHandler(pool *Pool, shadows *ShadowManager) http.Handler {
+	return &GatewayHandler{pool: pool, shadows: shadows}
 }
 
 func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	removeHopHeaders(r.Header)
 	lease, err := h.pool.Acquire(r.Context())
 	if err != nil {
 		if errors.Is(err, ErrNoCapacity) {
@@ -26,6 +28,12 @@ func (h *GatewayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer lease.release()
+	verification, shadowWriter, shadowing := h.shadows.Start(r)
+	if shadowing {
+		shadowWriter.ResponseWriter = w
+		w = shadowWriter
+		defer func() { verification.finishPrimary(shadowWriter, shadowWriter.writeErr) }()
+	}
 
 	targetURL, err := url.Parse(lease.node.address)
 	if err != nil {
@@ -48,9 +56,7 @@ func proxyDirector(target *url.URL) func(*http.Request) {
 		req.URL.Host = target.Host
 		req.Host = target.Host
 		req.RequestURI = ""
-		for _, header := range hopHeaders {
-			req.Header.Del(header)
-		}
+		removeHopHeaders(req.Header)
 	}
 }
 

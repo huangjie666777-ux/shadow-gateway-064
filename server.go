@@ -23,29 +23,32 @@ type Config struct {
 type App struct {
 	config      Config
 	pool        *Pool
+	shadows     *ShadowManager
 	proxyServer *http.Server
 	adminServer *http.Server
 }
 
 func NewApp(config Config) *App {
 	pool := NewPool()
+	shadows := NewShadowManager()
 	if _, err := pool.Publish(config.Initial); err != nil {
 		log.Fatalf("invalid initial upstreams: %v", err)
 	}
 
 	proxyRouter := chi.NewRouter()
-	proxyRouter.Handle("/*", NewGatewayHandler(pool))
+	proxyRouter.Handle("/*", NewGatewayHandler(pool, shadows))
 
 	return &App{
-		config: config,
-		pool:   pool,
+		config:  config,
+		pool:    pool,
+		shadows: shadows,
 		proxyServer: &http.Server{
 			Addr:    config.ProxyAddr,
 			Handler: proxyRouter,
 		},
 		adminServer: &http.Server{
 			Addr:    config.AdminAddr,
-			Handler: NewAdminRouter(pool),
+			Handler: NewAdminRouter(pool, shadows),
 		},
 	}
 }
@@ -80,26 +83,29 @@ func (a *App) serve(server *http.Server, name string) error {
 func (a *App) Shutdown() error {
 	log.Println("shutting down and draining proxy requests")
 	a.pool.Shutdown()
+	drainCtx, cancel := context.WithTimeout(context.Background(), a.config.DrainTimeout)
+	defer cancel()
 
 	proxyDone := make(chan error, 1)
+	shadowDone := make(chan struct{})
 	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), a.config.DrainTimeout)
-		defer cancel()
-		proxyDone <- a.proxyServer.Shutdown(ctx)
+		proxyDone <- a.proxyServer.Shutdown(drainCtx)
+	}()
+	go func() {
+		a.shadows.Shutdown(drainCtx)
+		close(shadowDone)
 	}()
 
-	timer := time.NewTimer(a.config.DrainTimeout)
-	defer timer.Stop()
 	select {
 	case err := <-proxyDone:
+		<-shadowDone
 		return a.shutdownAdmin(err)
-	case <-timer.C:
+	case <-drainCtx.Done():
 		log.Println("drain timeout; canceling remaining requests")
 		err := a.proxyServer.Close()
 		_ = a.adminServer.Close()
-		if drainErr := <-proxyDone; drainErr != nil {
-			return drainErr
-		}
+		<-shadowDone
+		<-proxyDone
 		return err
 	}
 }

@@ -22,7 +22,7 @@ func TestProxyForwardsMethodPathQueryBodyAndResponse(t *testing.T) {
 
 	pool := NewPool()
 	_, _ = pool.Publish([]UpstreamConfig{{ID: "a", Address: upstream.URL, Limit: 1}})
-	gateway := httptest.NewServer(NewGatewayHandler(pool))
+	gateway := httptest.NewServer(NewGatewayHandler(pool, NewShadowManager()))
 	defer gateway.Close()
 
 	req, _ := http.NewRequest(http.MethodPost, gateway.URL+"/demo?x=1", strings.NewReader("payload"))
@@ -38,7 +38,7 @@ func TestProxyForwardsMethodPathQueryBodyAndResponse(t *testing.T) {
 }
 
 func TestNoCapacityReturns503(t *testing.T) {
-	gateway := httptest.NewServer(NewGatewayHandler(NewPool()))
+	gateway := httptest.NewServer(NewGatewayHandler(NewPool(), NewShadowManager()))
 	defer gateway.Close()
 	resp, err := http.Post(gateway.URL, "text/plain", strings.NewReader("x"))
 	if err != nil {
@@ -57,7 +57,7 @@ func TestConnectionFailureReturns502(t *testing.T) {
 
 	pool := NewPool()
 	_, _ = pool.Publish([]UpstreamConfig{{ID: "dead", Address: address, Limit: 1}})
-	gateway := httptest.NewServer(NewGatewayHandler(pool))
+	gateway := httptest.NewServer(NewGatewayHandler(pool, NewShadowManager()))
 	defer gateway.Close()
 
 	resp, err := http.Get(gateway.URL)
@@ -87,7 +87,7 @@ func TestLeaseHeldUntilStreamEndAndClientCancelReleases(t *testing.T) {
 
 	pool := NewPool()
 	_, _ = pool.Publish([]UpstreamConfig{{ID: "a", Address: upstream.URL, Limit: 1}})
-	gateway := httptest.NewServer(NewGatewayHandler(pool))
+	gateway := httptest.NewServer(NewGatewayHandler(pool, NewShadowManager()))
 	defer gateway.Close()
 
 	client := &http.Client{Timeout: 5 * time.Second}

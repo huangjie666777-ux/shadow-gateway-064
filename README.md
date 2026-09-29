@@ -11,6 +11,10 @@
 - 方法、路径、查询、请求体、响应状态和响应正文透传，逐跳头由 `httputil.ReverseProxy` 清理。
 - 上传、下载和分块响应均流式处理；在途计数在响应体复制完成或客户端取消后才释放。
 - 删除或修改地址的节点进入旧代 `draining`，不接新流量；旧请求完成后自动回收空闲连接。
+- 可选影子流量：仅匹配前缀且无请求体的 `GET` 向候选旁路发送一次，不加入正式节点池、不排队、不重试。
+- 主响应持续流式转发；双方正文均完整且不超过 1 MiB 时比较状态码和原始字节，否则记为无法判定并说明原因。
+- 所有策略版本共享影子在途预算；策略更新后旧任务继续，降低并发不会取消旧任务；客户端断开会取消候选旁路。
+- 管理端可查询在途数、累计跳过数和最近 100 条已结束核验，结果不保存响应正文。
 - 收到 `SIGINT`/`SIGTERM` 后立即停止接收代理请求，在 `DRAIN_TIMEOUT` 内等待，超时取消剩余请求。
 
 ## 文件职责
@@ -21,6 +25,7 @@
 - `proxy.go`：HTTP 反向代理和流式转发。
 - `admin.go`：Chi 管理路由。
 - `server.go`：代理/管理 HTTP 服务、信号处理和优雅退出。
+- `shadow.go`：影子策略、容量预算、旁路请求、有界采集和结果判定。
 - `cmd/upstream/main.go`：本机演示上游。
 
 ## 配置
@@ -130,6 +135,47 @@ curl -sS -X PUT http://127.0.0.1:8081/admin/upstreams \
 ```
 
 两个节点都被占用时，新请求立即得到 `503 Service Unavailable`，不会排队。旧代长请求结束后，节点 `a` 从状态中消失且空闲连接被回收，后续请求只发往 `b`。
+
+## 影子流量核验
+
+整份替换影子策略：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8081/admin/shadow \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "enabled": true,
+    "candidate_address": "http://127.0.0.1:9002",
+    "path_prefix": "/echo",
+    "max_concurrency": 4,
+    "timeout_ms": 1000
+  }'
+```
+
+地址规则与正式上游相同：必须是 `http://host:port`，不含路径、查询、用户信息或非标准端口范围。`path_prefix` 必须以 `/` 开头；`max_concurrency` 和 `timeout_ms` 必须是正整数。校验失败会返回 400，活动策略和版本不变。
+
+查询活动策略和核验状态：
+
+```bash
+curl -sS http://127.0.0.1:8081/admin/shadow
+curl -sS http://127.0.0.1:8081/admin/shadow/status
+```
+
+状态字段：
+
+- `inflight`：所有策略版本共享预算内尚未结束的核验数。
+- `total_skipped`：路径和方法匹配但影子容量已满的累计次数；非匹配请求、非 `GET`、带请求体请求不计入。
+- `recent_results`：按结束顺序保存最近 100 条，旧结果自动淘汰。
+- `decision` 为 `equal`、`different` 或 `unknown`；`unknown` 的 `reason` 包括正文超限、断流、候选超时或取消。
+
+触发核验：
+
+```bash
+curl -sS 'http://127.0.0.1:8080/echo?x=1'
+curl -sS http://127.0.0.1:8081/admin/shadow/status
+```
+
+影子请求沿用原路径、查询和端到端请求头，使用候选主机作为 `Host`。正式响应只由正式上游产生，候选慢、失败或内容不同都不会改变、延迟或截断客户端响应。切流前可先把 `enabled` 设为 `false` 发布，再替换正式上游。
 
 ## 优雅退出
 
