@@ -11,6 +11,9 @@
 - 方法、路径、查询、请求体、响应状态和响应正文透传，逐跳头由 `httputil.ReverseProxy` 清理。
 - 上传、下载和分块响应均流式处理；在途计数在响应体复制完成或客户端取消后才释放。
 - 删除或修改地址的节点进入旧代 `draining`，不接新流量；旧请求完成后自动回收空闲连接。
+- 切流前可对无请求体的 GET 做影子核验：旁路只发一次，不进入正式节点池、不排队、不重试。
+- 影子正文最多采集 1 MiB；双方完整读取后比较状态码和原始字节，超限、断流、超时或取消均为 `unknown`，不保存正文。
+- 影子策略可整体查询/替换，校验通过后原子发布并递增版本；旧版本任务继续执行，共享在途预算，退出时随原 `DRAIN_TIMEOUT` 一起排空。
 - 收到 `SIGINT`/`SIGTERM` 后立即停止接收代理请求，在 `DRAIN_TIMEOUT` 内等待，超时取消剩余请求。
 
 ## 文件职责
@@ -20,6 +23,7 @@
 - `pool.go`：原子发布、容量调度、代际节点、排空和连接回收。
 - `proxy.go`：HTTP 反向代理和流式转发。
 - `admin.go`：Chi 管理路由。
+- `shadow.go`：影子策略、并发预算、有界正文采集、版本传输和结果环窗。
 - `server.go`：代理/管理 HTTP 服务、信号处理和优雅退出。
 - `cmd/upstream/main.go`：本机演示上游。
 
@@ -84,12 +88,106 @@ curl -sS http://127.0.0.1:8081/admin/config
 curl -sS http://127.0.0.1:8081/admin/nodes
 ```
 
+发布影子策略：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8081/admin/shadow-policy \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "enabled": true,
+    "candidate_url": "http://127.0.0.1:9002",
+    "path_prefix": "/api",
+    "concurrency": 4,
+    "timeout_ms": 1000
+  }'
+```
+
+字段要求：
+
+- `candidate_url` 与正式上游相同，只允许 `http://host:port`，不能带路径、查询或用户信息。
+- `path_prefix` 必须以 `/` 开头，仅路径前缀匹配的无请求体 GET 会触发旁路。
+- `concurrency` 和 `timeout_ms` 都是正整数；容量满时立即跳过并累计 `skipped`。
+
+查询影子策略：
+
+```bash
+curl -sS http://127.0.0.1:8081/admin/shadow-policy
+```
+
+查询在途、跳过和最近 100 条已结束核验：
+
+```bash
+curl -sS http://127.0.0.1:8081/admin/shadow-status
+```
+
+结果按结束顺序追加并淘汰最旧记录，包含 `id`、固定的 `policy_version`、`path`、双方状态码、`verdict` 以及无法判定原因；`verdict` 为 `equal`、`different` 或 `unknown`。
+
 状态字段：
 
 - `state=active`：当前配置中的节点。
 - `state=draining`：被删除或改地址的旧代节点。
 - `inflight`：尚未完成请求体/响应体的在途请求数。
 - `generation`：发布版本，便于区分同 id 的新旧节点。
+
+## 影子流量核验
+
+确认正式节点为 `upstream-a`，候选为 `upstream-b` 后发布策略：
+
+```bash
+curl -sS -X PUT http://127.0.0.1:8081/admin/shadow-policy \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "enabled": true,
+    "candidate_url": "http://127.0.0.1:9002",
+    "path_prefix": "/echo",
+    "concurrency": 2,
+    "timeout_ms": 1000
+  }'
+```
+
+发送一个匹配且无请求体的 GET：
+
+```bash
+curl -sS 'http://127.0.0.1:8080/echo?x=1'
+# upstream-a /echo?x=1
+```
+
+正式响应仍来自 `upstream-a`。候选请求在后台完成后查询：
+
+```bash
+curl -sS http://127.0.0.1:8081/admin/shadow-status
+```
+
+示例：
+
+```json
+{
+  "policy": {
+    "version": 1,
+    "policy": {
+      "enabled": true,
+      "candidate_url": "http://127.0.0.1:9002",
+      "path_prefix": "/echo",
+      "concurrency": 2,
+      "timeout_ms": 1000
+    }
+  },
+  "inflight": 0,
+  "skipped": 0,
+  "results": [
+    {
+      "id": "dc9252840e1b46dd8fc84294f18e6a49",
+      "policy_version": 1,
+      "path": "/echo",
+      "primary_status": 200,
+      "candidate_status": 200,
+      "verdict": "different"
+    }
+  ]
+}
+```
+
+该示例两个上游响应都完整且小于 1 MiB，但正文分别是 `upstream-a ...` 与 `upstream-b ...`，因此判定为 `different`。POST、带请求体的 GET、前缀不匹配、候选超时或任一正文超过 1 MiB 都不会得到错误的“前缀一致”结论。
 
 ## 转发与滚动摘流
 

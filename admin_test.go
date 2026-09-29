@@ -10,7 +10,7 @@ import (
 
 func TestAdminReplaceConfigAndQueryStatus(t *testing.T) {
 	pool := NewPool()
-	router := NewAdminRouter(pool)
+	router := NewAdminRouter(pool, NewShadowManager())
 	server := httptest.NewServer(router)
 	defer server.Close()
 
@@ -51,7 +51,7 @@ func TestAdminReplaceConfigAndQueryStatus(t *testing.T) {
 func TestAdminRejectsInvalidWholeTable(t *testing.T) {
 	pool := NewPool()
 	_, _ = pool.Publish([]UpstreamConfig{{ID: "keep", Address: "http://127.0.0.1:9001", Limit: 1}})
-	server := httptest.NewServer(NewAdminRouter(pool))
+	server := httptest.NewServer(NewAdminRouter(pool, NewShadowManager()))
 	defer server.Close()
 
 	body := []byte(`[{"id":"bad","address":"https://127.0.0.1:9002/path","limit":0}]`)

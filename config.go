@@ -38,35 +38,69 @@ func validateUpstreams(input []UpstreamConfig) error {
 			return fmt.Errorf("upstream %q limit must be a positive integer", upstream.ID)
 		}
 
-		parsed, err := url.Parse(upstream.Address)
-		if err != nil {
-			return fmt.Errorf("upstream %q address is invalid: %w", upstream.ID, err)
-		}
-		if parsed.Scheme != "http" {
-			return fmt.Errorf("upstream %q address must use http", upstream.ID)
-		}
-		if parsed.User != nil {
-			return fmt.Errorf("upstream %q address must only contain host and port", upstream.ID)
-		}
-		if parsed.Path != "" {
-			return fmt.Errorf("upstream %q address must not contain a path", upstream.ID)
-		}
-		if parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
-			return fmt.Errorf("upstream %q address must only contain host and port", upstream.ID)
-		}
-		host, port, err := net.SplitHostPort(parsed.Host)
-		if err != nil || host == "" || port == "" {
-			return fmt.Errorf("upstream %q address must contain a host and port", upstream.ID)
-		}
-		portNumber, err := strconv.Atoi(port)
-		if err != nil || portNumber < 1 || portNumber > 65535 {
-			return fmt.Errorf("upstream %q port must be between 1 and 65535", upstream.ID)
-		}
-		if parsed.Host != net.JoinHostPort(host, port) {
-			return fmt.Errorf("upstream %q address must contain a host and port", upstream.ID)
+		if err := validateHTTPAddress(upstream.Address, fmt.Sprintf("upstream %q address", upstream.ID)); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+func validateHTTPAddress(address, field string) error {
+	parsed, err := url.Parse(address)
+	if err != nil {
+		return fmt.Errorf("%s is invalid: %w", field, err)
+	}
+	if parsed.Scheme != "http" {
+		return fmt.Errorf("%s must use http", field)
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("%s must only contain host and port", field)
+	}
+	if parsed.Path != "" {
+		return fmt.Errorf("%s must not contain a path", field)
+	}
+	if parsed.RawPath != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.RawFragment != "" {
+		return fmt.Errorf("%s must only contain host and port", field)
+	}
+	host, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil || host == "" || port == "" {
+		return fmt.Errorf("%s must contain a host and port", field)
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return fmt.Errorf("%s port must be between 1 and 65535", field)
+	}
+	if parsed.Host != net.JoinHostPort(host, port) {
+		return fmt.Errorf("%s must contain a host and port", field)
+	}
+	return nil
+}
+
+func removeHopHeaders(headers http.Header) {
+	connectionTokens := strings.Split(headers.Get("Connection"), ",")
+	for _, token := range connectionTokens {
+		if token = strings.TrimSpace(token); token != "" {
+			if fields := strings.FieldsFunc(token, func(r rune) bool { return r == ';' || r == ',' }); len(fields) > 0 {
+				token = strings.TrimSpace(fields[0])
+			}
+			headers.Del(token)
+		}
+	}
+	for _, header := range hopHeaderNames {
+		headers.Del(header)
+	}
+}
+
+var hopHeaderNames = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"Te",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
 }
 
 func decodeUpstreams(r *http.Request) ([]UpstreamConfig, error) {
